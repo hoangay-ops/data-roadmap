@@ -1,0 +1,1101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>All of Us — Data Roadmap</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{min-height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f7f8fa;color:#1a1a1a;overflow:auto;font-size:14px;}
+button,select,input{font-family:inherit;}
+::-webkit-scrollbar{width:8px;height:8px;}
+::-webkit-scrollbar-thumb{background:#d8d8d8;border-radius:4px;}
+::-webkit-scrollbar-thumb:hover{background:#bbb;}
+</style>
+</head>
+<body>
+<div id="root" style="min-height:100vh;height:100vh;display:flex;flex-direction:column;"></div>
+<script type="text/babel" data-presets="env,react">
+
+const {useState, useMemo, useEffect, useRef, useCallback} = React;
+
+/* ════════════════════════════════════════════════════════════════════════════
+   LIVE DATA SOURCE — published Google Sheets CSV.
+   The sheet owner controls all content; this dashboard auto-refreshes on load.
+   ════════════════════════════════════════════════════════════════════════════ */
+
+const ROADMAP_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQiTGuF5UvMMCQMSWP_gA7D8I-LDXv5kcJmy3UnRqbEgdQT9jW2oN4lrv-PVYj1wpFcMZOwZxrBe8vn/pub?gid=0&single=true&output=csv";
+
+function addCacheBuster(url){
+  return url + (url.indexOf("?") === -1 ? "?" : "&") + "_=" + Date.now();
+}
+
+/* CSV parser handles quoted fields, escaped quotes, and \r\n / \n line endings. */
+function parseCSV(text){
+  var rows=[], row=[], cell="", inQ=false;
+  for(var i=0;i<text.length;i++){
+    var c=text[i], n=text[i+1];
+    if(c==='"'&&inQ&&n==='"'){cell+='"';i++;}
+    else if(c==='"')inQ=!inQ;
+    else if(c===','&&!inQ){row.push(cell);cell="";}
+    else if((c==='\n'||c==='\r')&&!inQ){
+      if(cell||row.length){row.push(cell);rows.push(row);row=[];cell="";}
+      if(c==='\r'&&n==='\n')i++;
+    }
+    else cell+=c;
+  }
+  if(cell||row.length){row.push(cell);rows.push(row);}
+  return rows;
+}
+
+function normHeader(h){
+  return String(h||"").toLowerCase().replace(/[\r\n]+/g," ").replace(/\s+/g," ").trim();
+}
+
+/* Parse the published CSV into row objects keyed by the expected column names.
+   Column header matching is case- and whitespace-insensitive. Accepts common
+   variants ("data release" vs "datarelease", "show on roadmap" vs "showonroadmap"). */
+function parseRoadmapCsv(csvText){
+  if(!csvText) return [];
+  var rows = parseCSV(csvText);
+  if(!rows.length) return [];
+  var header = rows[0].map(normHeader);
+  var idx = {};
+  function findCol(){
+    for(var i = 0; i < arguments.length; i++){
+      var want = normHeader(arguments[i]);
+      var pos = header.indexOf(want);
+      if(pos !== -1) return pos;
+    }
+    return -1;
+  }
+  idx.id          = findCol("id");
+  idx.name        = findCol("name");
+  idx.parent      = findCol("parent");
+  idx.start       = findCol("start");
+  idx.end         = findCol("end");
+  idx.cat         = findCol("cat", "category");
+  idx.icon        = findCol("icon");
+  idx.overviewUrl = findCol("overviewurl", "overview url", "url");
+  idx.showOnRoadmap = findCol("showonroadmap", "show on roadmap", "show");
+  idx.description = findCol("description", "desc");
+  idx.team        = findCol("team");
+  idx.dataRelease = findCol("data release", "datarelease", "release");
+
+  function get(row, key){
+    var pos = idx[key];
+    if(pos === -1 || pos >= row.length) return "";
+    return String(row[pos] || "").trim();
+  }
+
+  var out = [];
+  for(var r = 1; r < rows.length; r++){
+    var row = rows[r];
+    // Skip blank rows
+    var hasContent = false;
+    for(var c = 0; c < row.length; c++){
+      if(row[c] && String(row[c]).trim()){ hasContent = true; break; }
+    }
+    if(!hasContent) continue;
+
+    out.push({
+      id:            get(row, "id"),
+      name:          get(row, "name"),
+      parent:        get(row, "parent"),
+      start:         get(row, "start"),
+      end:           get(row, "end"),
+      cat:           get(row, "cat"),
+      icon:          get(row, "icon"),
+      overviewUrl:   get(row, "overviewUrl"),
+      showOnRoadmap: get(row, "showOnRoadmap"),
+      description:   get(row, "description"),
+      team:          get(row, "team"),
+      dataRelease:   get(row, "dataRelease"),
+    });
+  }
+  return out;
+}
+
+/* React hook: fetches the published CSV on mount, exposes {status, error, rows, loadedAt, reload}. */
+function useRoadmapData(){
+  var [state, setState] = useState({
+    status: "loading",
+    error: "",
+    rows: [],
+    loadedAt: null,
+  });
+
+  var load = useCallback(function(){
+    setState(function(s){ return Object.assign({}, s, {status:"loading", error:""}); });
+    fetch(addCacheBuster(ROADMAP_CSV_URL), {cache:"no-store"})
+      .then(function(r){
+        if(!r.ok) throw new Error("HTTP "+r.status+" — check that the sheet is published to the web");
+        return r.text();
+      })
+      .then(function(text){
+        if(text.toLowerCase().indexOf("<html") > -1){
+          throw new Error("Sheet returned HTML instead of CSV — check the publish-to-web settings (must publish as CSV)");
+        }
+        var parsed = parseRoadmapCsv(text);
+        setState({
+          status: "ready",
+          error: "",
+          rows: parsed,
+          loadedAt: new Date(),
+        });
+      })
+      .catch(function(err){
+        setState(function(s){ return Object.assign({}, s, {status:"error", error: err.message || String(err)}); });
+      });
+  }, []);
+
+  useEffect(function(){ load(); }, [load]);
+  return {state: state, reload: load};
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   CONSTANTS & HELPERS
+   ════════════════════════════════════════════════════════════════════════════ */
+
+const RM_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+/* Data Roadmap uses a teal palette for milestones, distinct from the Program
+   Roadmap's amber. Circle = data point (smaller, low-noise); Flag = release. */
+const RM_MILESTONE_COLOR = "#138D75";        // primary teal for flags
+const RM_MILESTONE_CIRCLE_COLOR = "#5DADE2"; // softer cyan-blue for data-point circles
+
+const RM_ROW_H = 44;
+const RM_LABEL_W = 320;
+
+/* Team color palette — assigns a consistent color to each team encountered.
+   Teams aren't fixed like Goals, so we compute the palette dynamically. */
+const TEAM_PALETTE = [
+  {color:"#5EAEE0", text:"#2E78A6"},  // blue
+  {color:"#7AC79B", text:"#3F8E5F"},  // green
+  {color:"#F58D77", text:"#C25A45"},  // coral
+  {color:"#FFDD7F", text:"#9C7A1F"},  // gold
+  {color:"#F2728C", text:"#C04A66"},  // rose
+  {color:"#B084CC", text:"#6C3483"},  // purple
+  {color:"#85C1E2", text:"#21618C"},  // sky
+  {color:"#F4A261", text:"#B3541E"},  // orange
+];
+
+/* Data Release color palette — used for the dataRelease badge */
+const RELEASE_COLORS = {
+  "CDRv9": {bg:"#E8F4FD", tx:"#1F618D"},
+  "CDRv10": {bg:"#E8F8F2", tx:"#117A65"},
+  "CDRv11": {bg:"#FDF2E9", tx:"#B3541E"},
+};
+function releaseColor(rel){
+  if(!rel) return null;
+  return RELEASE_COLORS[rel] || {bg:"#EAECEE", tx:"#566573"};
+}
+
+function renderText(value, fallback){
+  if(fallback === undefined) fallback = "";
+  if(value == null) return fallback;
+  if(typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if(typeof value === "function" || typeof value === "object") return fallback;
+  return String(value);
+}
+
+function AoU(){ return <em style={{fontStyle:"italic"}}>All of Us</em>; }
+
+function rmParseDate(s){
+  if(!s) return null;
+  s = String(s).trim();
+  var slash = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if(slash){ var yr = +slash[3]; if(yr < 100) yr += 2000; return new Date(yr, +slash[1]-1, +slash[2]); }
+  var dash = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if(dash) return new Date(+dash[1], +dash[2]-1, +dash[3]);
+  return null;
+}
+
+const RM_TODAY = (function(){
+  try {
+    var params = new URLSearchParams(window.location.search || "");
+    var asOf = params.get("asOf");
+    if(asOf){ var d = rmParseDate(asOf); if(d) return d; }
+  } catch(e){}
+  return new Date();
+})();
+
+const RM_DEFAULT_RANGE = (function(){
+  // Default: 3 months before today through 12 months after, snapped to quarters
+  var now = new Date();
+  var startY = now.getFullYear(), startM = Math.max(0, now.getMonth() - 3);
+  var currentQuarterEndM = Math.floor(now.getMonth() / 3) * 3 + 2;
+  var endDate = new Date(now.getFullYear(), currentQuarterEndM + 12, 1);
+  var fmt = function(y, m){ return y + "-" + String(m + 1).padStart(2, "0"); };
+  return { start: fmt(startY, startM), end: fmt(endDate.getFullYear(), endDate.getMonth()) };
+})();
+
+function rmHasFullDates(item){ return Boolean(item && item.start && item.end); }
+function rmIsComplete(item){
+  if(!item) return false;
+  var end = rmParseDate(item.end);
+  return Boolean(end && end < RM_TODAY);
+}
+function rmFmtDate(s){
+  if(!s) return "";
+  var d = rmParseDate(s);
+  if(!d) return s;
+  return d.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
+}
+function rmGenMonths(vs, ve){
+  var a = [], y = vs.getFullYear(), m = vs.getMonth();
+  for(;;){
+    var s = new Date(y, m, 1);
+    if(s > ve) break;
+    var end = new Date(y, m+1, 0);
+    a.push({label:RM_MONTHS[m], start:s, end:end, q:"Q"+(Math.floor(m/3)+1)+" "+y});
+    if(++m > 11){ m = 0; y++; }
+  }
+  return a;
+}
+function rmGroupByQuarter(months){
+  var qs = [], cur = null;
+  months.forEach(function(m, i){
+    if(!cur || cur.q !== m.q){ cur = {q:m.q, start:i, count:1}; qs.push(cur); }
+    else cur.count++;
+  });
+  return qs;
+}
+function rmMonthOpts(){
+  var a = [];
+  for(var y = 2024; y <= 2030; y++){
+    for(var m = 0; m < 12; m++){
+      a.push({label: RM_MONTHS[m]+" "+y, value: y+"-"+String(m+1).padStart(2,"0")});
+    }
+  }
+  return a;
+}
+const RM_MONTH_OPTS = rmMonthOpts();
+
+function rmSpreadMs(ms, pctFn){
+  var pos = ms.map(function(m){
+    var raw = pctFn(m.start, false);
+    if(raw === null) return null;
+    var clamped = Math.max(0, Math.min(100, raw));
+    return Object.assign({}, m, {pv:clamped, clipped: raw !== clamped});
+  }).filter(function(m){return m !== null;});
+  pos.sort(function(a, b){return a.pv - b.pv;});
+  var res = [];
+  for(var i = 0; i < pos.length; i++){
+    var yo = 0;
+    for(var j = 0; j < res.length; j++){
+      if(Math.abs(pos[i].pv - res[j].pv) < 2){
+        yo = res[j].yo === 0 ? -8 : res[j].yo === -8 ? 8 : res[j].yo + 8;
+      }
+    }
+    res.push(Object.assign({}, pos[i], {yo:yo}));
+  }
+  return res;
+}
+
+/* Normalize raw rows into Projects + Milestones with team color assignment.
+   Projects: rows with cat=Project (have start+end, become bars)
+   Milestones: rows with cat=Milestone and a parent name (attach to parent project) */
+function normalizeRows(rows){
+  var projects = [], milestones = [];
+  var teamColorMap = {};
+  var teamIdx = 0;
+
+  rows.forEach(function(r){
+    if(String(r.showOnRoadmap || "").toUpperCase() === "FALSE") return;
+    var cat = String(r.cat || "").toLowerCase();
+    if(cat === "project"){
+      var team = r.team || "Untitled";
+      if(!teamColorMap[team]){
+        teamColorMap[team] = TEAM_PALETTE[teamIdx % TEAM_PALETTE.length];
+        teamIdx++;
+      }
+      projects.push({
+        id: r.id || ("proj-" + r.name.replace(/[^a-z0-9]+/gi,"-")).toLowerCase(),
+        name: r.name,
+        start: r.start || null,
+        end: r.end || null,
+        team: team,
+        teamColor: teamColorMap[team].color,
+        teamTextColor: teamColorMap[team].text,
+        dataRelease: r.dataRelease || "",
+        description: r.description || "",
+        overviewUrl: r.overviewUrl || "",
+        cat: "project",
+      });
+    } else if(cat === "milestone" && r.parent){
+      var iconNorm = String(r.icon || "").toLowerCase();
+      milestones.push({
+        id: ("ms-" + r.parent + "-" + r.name + "-" + (r.start || "")).replace(/[^a-zA-Z0-9._-]+/g,"-").slice(0,80),
+        name: r.name,
+        start: r.start || r.end || null,
+        end: r.end || null,
+        parent: r.parent,
+        icon: iconNorm === "flag" ? "flag" : "circle",  // default circle
+      });
+    }
+  });
+
+  // Attach milestones to projects, drop orphans
+  var projByName = {};
+  projects.forEach(function(p){ projByName[p.name] = p; });
+  var attached = milestones.filter(function(m){
+    var p = projByName[m.parent];
+    if(!p) return false;
+    return true;
+  }).map(function(m){
+    var p = projByName[m.parent];
+    return Object.assign({}, m, {projectId: p.id});
+  });
+
+  return {projects: projects, milestones: attached, teamColorMap: teamColorMap};
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   ICONS & SMALL COMPONENTS
+   ════════════════════════════════════════════════════════════════════════════ */
+
+function RmCircleIcon(props){
+  var sz = props.sz || 10, col = props.col || RM_MILESTONE_CIRCLE_COLOR;
+  // Smaller, calmer marker for data-point milestones (frequent occurrences)
+  return <svg width={sz} height={sz} viewBox="0 0 24 24" fill={col} stroke="#fff" strokeWidth="2" style={props.style || {}}>
+    <circle cx="12" cy="12" r="9"/>
+  </svg>;
+}
+function RmFlagIcon(props){
+  var sz = props.sz || 20, col = props.col || RM_MILESTONE_COLOR;
+  // Larger, bolder marker for release / launch milestones (high-impact moments)
+  return <svg width={sz} height={sz} viewBox="0 0 24 24" fill={col} stroke="#fff" strokeWidth="1.2" strokeLinejoin="round" style={props.style || {}}>
+    <path d="M5 3v18M5 4h13l-2.5 4.5L18 13H5"/>
+  </svg>;
+}
+/* RmMsIcon: when no explicit sz passed, each icon uses its own appropriate
+   default (flag larger than circle for visual hierarchy). */
+function RmMsIcon(props){
+  return props.icon === "flag"
+    ? <RmFlagIcon sz={props.sz} col={props.col} style={props.style}/>
+    : <RmCircleIcon sz={props.sz} col={props.col} style={props.style}/>;
+}
+
+function RmGridLines(props){
+  return <div style={{position:"absolute",inset:0,zIndex:1,pointerEvents:"none",display:"flex",overflow:"hidden"}}>
+    {Array.from({length: props.n}).map(function(_, i){
+      return <div key={i} style={{flex:1, borderRight: i < props.n-1 ? "1px solid "+(props.faint ? "#f2f2f2" : "#e8e8e8") : "none"}}/>;
+    })}
+  </div>;
+}
+function RmSep(){ return <span style={{width:1,height:20,background:"#e8e8e8",flexShrink:0}}/>; }
+function RmSegBtn(props){
+  return <button onClick={props.onClick} style={{fontSize:11.5,padding:"4px 10px",border:"1px solid "+(props.active ? "#2471A3" : "#e0e0e0"),borderRadius:6,background: props.active ? "#2471A3" : "#fff",color: props.active ? "#fff" : "#666",cursor:"pointer", fontWeight: props.active ? 600 : 400}}>{props.children}</button>;
+}
+function RmTog(props){
+  return <button onClick={props.onClick} title={props.title} style={{fontSize:11.5,padding:"4px 10px",border:"1px solid "+(props.on ? "#2471A3" : "#e0e0e0"),borderRadius:6,background: props.on ? "#EBF5FB" : "#fff",color: props.on ? "#2471A3" : "#888",cursor:"pointer", fontWeight: props.on ? 600 : 400}}>{props.children}</button>;
+}
+
+function RmMultiSelect(props){
+  var label = props.label, options = props.options, selected = props.selected, onChange = props.onChange;
+  var getKey = props.getKey, getLabel = props.getLabel, getColor = props.getColor;
+  var [open, setOpen] = useState(false);
+  var ref = useRef(null);
+  useEffect(function(){
+    function h(e){ if(ref.current && !ref.current.contains(e.target)) setOpen(false); }
+    document.addEventListener("mousedown", h);
+    return function(){ document.removeEventListener("mousedown", h); };
+  }, []);
+  var all = selected.length === 0;
+  function toggle(k){
+    onChange(selected.indexOf(k) !== -1 ? selected.filter(function(x){return x !== k;}) : selected.concat([k]));
+  }
+  function CB(p){
+    return <span style={{width:14, height:14, borderRadius:3,border:"1px solid "+(p.on ? "#2471A3" : "#ccc"),background: p.on ? "#2471A3" : "#fff",display:"inline-flex", alignItems:"center", justifyContent:"center", flexShrink:0}}>{p.on && <span style={{color:"#fff",fontSize:9}}>✓</span>}</span>;
+  }
+  return (
+    <div ref={ref} style={{position:"relative",display:"inline-block"}}>
+      <button onClick={function(){setOpen(!open);}} style={{fontSize:11.5,padding:"4px 10px",border:"1px solid "+(open || !all ? "#2471A3" : "#e0e0e0"),borderRadius:6,background:open || !all ? "#EBF5FB" : "#fff",color:open || !all ? "#2471A3" : "#666",cursor:"pointer",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:open || !all ? 600 : 400}}>
+        {all ? label : label+" ("+selected.length+")"}
+        <span style={{fontSize:8,opacity:.6}}>{open ? "▲" : "▼"}</span>
+      </button>
+      {open && (
+        <div style={{position:"absolute",top:"calc(100% + 4px)",left:0,zIndex:600,background:"#fff",border:"1px solid #e0e0e0",borderRadius:8,boxShadow:"0 8px 24px rgba(0,0,0,.10)",minWidth:220,padding:"6px 0",maxHeight:340,overflowY:"auto"}}>
+          <div onClick={function(){onChange([]); setOpen(false);}} style={{fontSize:11.5,padding:"6px 12px",cursor:"pointer",color:all ? "#2471A3" : "#555",fontWeight:all ? 600 : 400,background:all ? "#EBF5FB" : "transparent",display:"flex",alignItems:"center",gap:8}}>
+            <CB on={all}/>All
+          </div>
+          <div style={{height:1,background:"#f0f0f0",margin:"4px 0"}}/>
+          {options.map(function(o){
+            var k = getKey(o), on = selected.indexOf(k) !== -1, c = getColor ? getColor(o) : null;
+            return (
+              <div key={k} onClick={function(){toggle(k);}} style={{fontSize:11.5,padding:"6px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,background:on ? "#EBF5FB" : "transparent",color:on ? "#2471A3" : "#333"}}>
+                <CB on={on}/>
+                {c && <span style={{width:10,height:10,borderRadius:2,background:c,display:"inline-block",flexShrink:0}}/>}
+                <span style={{whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{getLabel(o)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   VIEW GUIDE MODAL
+   ════════════════════════════════════════════════════════════════════════════ */
+
+function ViewGuide(props){
+  if(!props.open) return null;
+  var cards = props.cards || [];
+  return (
+    <div onClick={props.onClose} style={{position:"fixed",inset:0,zIndex:3000,background:"rgba(20,30,45,.46)",display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"42px 20px 20px",overflowY:"auto"}}>
+      <div onClick={function(e){e.stopPropagation();}} style={{background:"#fff",borderRadius:12,padding:"22px 26px",maxWidth:920,width:"100%",boxShadow:"0 20px 50px rgba(0,0,0,.28)",border:"1px solid rgba(255,255,255,.35)"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,marginBottom:14}}>
+          <div>
+            <div style={{fontSize:17,fontWeight:800,color:"#111",lineHeight:1.2}}>{props.title}</div>
+            {props.intro && <div style={{fontSize:11.5,color:"#7b8792",marginTop:3}}>{props.intro}</div>}
+          </div>
+          <button onClick={props.onClose} aria-label="Close guide" style={{border:"none",background:"none",fontSize:24,color:"#aaa",cursor:"pointer",lineHeight:1,padding:0}}>×</button>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",gap:12}}>
+          {cards.map(function(card, i){
+            return (
+              <div key={i} style={{padding:"13px 14px",border:"1px solid #ebebeb",borderRadius:9,background:card.bg || "#fff",display:"flex",flexDirection:"column",gap:8}}>
+                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  {card.icon && <span style={{fontSize:18,lineHeight:1}}>{card.icon}</span>}
+                  <div style={{fontSize:10.5,fontWeight:800,color:card.color || "#185FA5",textTransform:"uppercase",letterSpacing:.45}}>{card.title}</div>
+                </div>
+                <div style={{fontSize:11.5,color:"#5f6b75",lineHeight:1.45}}>{card.body}</div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HelpButton(props){
+  return (
+    <button onClick={props.onClick} title="How to use this dashboard" aria-label="How to use this dashboard" style={{
+      width:28, height:28, border:"1px solid #dcdcdc", borderRadius:6,
+      background: props.open ? "#EBF5FB" : "#fff",
+      color: props.open ? "#2471A3" : "#777",
+      cursor:"pointer", fontSize:13, fontWeight:800, lineHeight:1,
+      display:"inline-flex", alignItems:"center", justifyContent:"center", padding:0,
+    }}>?</button>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   PRINT
+   ════════════════════════════════════════════════════════════════════════════ */
+
+function rmHtmlEsc(s){
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function rmPctForPrint(d, isEnd, vs, ve){
+  if(!d) return null;
+  var D = rmParseDate(d);
+  if(!D) return null;
+  if(isEnd) D = new Date(D.getFullYear(), D.getMonth(), D.getDate()+1);
+  var t = ve - vs;
+  if(!t) return null;
+  return ((D - vs) / t) * 100;
+}
+function rmPrintRoadmap(){
+  var data = window.__roadmapPrintData;
+  if(!data || !data.groups || !data.cols || !data.cols.length){
+    alert("The roadmap is not ready to print yet.");
+    return;
+  }
+  var vs = data.vs instanceof Date ? data.vs : new Date(data.vs);
+  var ve = data.ve instanceof Date ? data.ve : new Date(data.ve);
+  var cols = data.cols || [], quarters = data.quarters || [], groups = data.groups || [];
+  var monthCount = Math.max(1, cols.length);
+  function gridLines(){ var out = ""; for(var i = 0; i < monthCount; i++) out += "<div></div>"; return out; }
+  function quarterHeader(){ var out = ""; quarters.forEach(function(q){ out += "<div class='qcell' style='grid-column:span "+Number(q.count || 1)+"'>"+rmHtmlEsc(q.q)+"</div>"; }); return out; }
+  function monthHeader(){ return cols.map(function(c){ return "<div class='mcell'>"+rmHtmlEsc(c.label)+"</div>"; }).join(""); }
+  function rowHtml(item){
+    var hasDates = rmHasFullDates(item);
+    var barColor = item.teamColor || "#777";
+    var left = rmPctForPrint(item.start, false, vs, ve);
+    var right = rmPctForPrint(item.end, true, vs, ve);
+    var w = (left !== null && right !== null) ? right - left : 0;
+    var bar = "";
+    if(hasDates && w > 0.2){
+      var l = Math.max(0, Math.min(100, left)), r = Math.max(0, Math.min(100, right));
+      var ww = Math.max(0.35, r - l);
+      bar = "<div class='bar' style='left:"+l+"%;width:"+ww+"%;background:"+barColor+";'></div>";
+    }
+    var ms = (data.msByParent && data.msByParent[item.id]) ? data.msByParent[item.id] : [];
+    var markers = ms.map(function(m){
+      var mp = rmPctForPrint(m.start, false, vs, ve);
+      if(mp === null) return "";
+      mp = Math.max(0, Math.min(100, mp));
+      var isFlag = m.icon === "flag";
+      var sym = isFlag ? "⚑" : "●";
+      var cls = isFlag ? "marker marker-flag" : "marker marker-circle";
+      return "<span class='"+cls+"' style='left:"+mp+"%' title='"+rmHtmlEsc(m.name)+"'>"+sym+"</span>";
+    }).join("");
+    return "<div class='prow item-row'><div class='plabel'><div class='ptitle'>"+rmHtmlEsc(item.name)+"</div><div class='pmeta'>"+rmHtmlEsc(item.team)+(item.dataRelease ? " · "+rmHtmlEsc(item.dataRelease) : "")+"</div></div><div class='ptimeline'><div class='month-grid'>"+gridLines()+"</div>"+bar+markers+"</div></div>";
+  }
+  var rows = "";
+  groups.forEach(function(pair){
+    var gKey = pair[0], gItems = pair[1] || [];
+    if(data.grouped){
+      var groupColor = (gItems[0] && gItems[0].teamColor) || "#777";
+      rows += "<div class='prow group-row'><div class='plabel group-label' style='border-left-color:"+groupColor+";color:"+groupColor+";'>"+rmHtmlEsc(gKey)+"</div><div class='ptimeline group-timeline'><div class='month-grid'>"+gridLines()+"</div></div></div>";
+    }
+    gItems.forEach(function(item){ rows += rowHtml(item); });
+  });
+  var todayLine = "";
+  if(data.today){
+    var tp = rmPctForPrint(data.today, false, vs, ve);
+    if(tp !== null && tp >= 0 && tp <= 100){
+      todayLine = "<div class='today' style='left:"+tp+"%'></div>";
+    }
+  }
+  var html = "<div class='print-title'><div class='print-org'>NIH · <em>All of Us</em> Research Program</div><div class='print-main'>Data Roadmap — Data Release View</div></div><div class='snapshot'><div class='phead'><div class='plabel head-label'></div><div class='ptimeline head-time'><div class='qgrid' style='grid-template-columns:repeat("+monthCount+",1fr)'>"+quarterHeader()+"</div><div class='mgrid' style='grid-template-columns:repeat("+monthCount+",1fr)'>"+monthHeader()+"</div>"+todayLine+"</div></div>"+rows+"</div>";
+  var printWin = window.open("about:blank", "_blank");
+  if(!printWin){
+    alert("Print window was blocked. Please allow pop-ups, then click Print again.");
+    return;
+  }
+  var printCss = "*{box-sizing:border-box}html,body{margin:0;padding:0;background:#fff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#333}@page{size:landscape;margin:.22in}*{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}.print-title{width:100%;padding:0 0 8px;margin:0 0 8px;border-bottom:1px solid #ddd}.print-org{font-size:10px;text-transform:uppercase;letter-spacing:1.2px;color:#666;font-weight:700;margin-bottom:2px}.print-main{font-size:17px;line-height:1.15;font-weight:800;color:#111}.snapshot{width:100%}.phead,.prow{display:grid;grid-template-columns:minmax(3.15in,36%) 1fr;width:100%;break-inside:avoid;page-break-inside:avoid}.phead{border-bottom:2px solid #d9d9d9;background:#f7f7f7;position:relative}.plabel{border-right:1px solid #dedede;padding:6px 8px;min-width:0}.ptimeline{position:relative;min-width:0;overflow:hidden}.head-time{min-height:42px}.qgrid,.mgrid{display:grid;width:100%}.qcell,.mcell{text-align:center;border-right:1px solid #e4e4e4;display:flex;align-items:center;justify-content:center}.qcell{height:20px;font-size:9px;font-weight:700;color:#777;background:#f5f5f5;border-bottom:1px solid #e6e6e6}.mcell{height:22px;font-size:9px;color:#999;background:#fbfbfb}.group-row{min-height:26px;background:#f5f5f5;border-bottom:1px solid #e8e8e8}.group-label{font-size:10.5px;font-weight:700;border-left:4px solid #777;display:flex;align-items:center;padding-left:10px}.group-timeline{min-height:26px}.item-row{min-height:44px;border-bottom:1px solid #eee}.ptitle{font-size:10.6px;line-height:1.22;font-weight:600;color:#222}.pmeta{font-size:8.5px;color:#999;margin-top:3px}.month-grid{position:absolute;inset:0;display:grid;grid-template-columns:repeat("+monthCount+",1fr);z-index:1;pointer-events:none}.month-grid>div{border-right:1px solid #f0f0f0;min-height:100%}.month-grid>div:last-child{border-right:none}.bar{position:absolute;top:50%;height:18px;transform:translateY(-50%);border-radius:4px;z-index:2;opacity:.85}.marker{position:absolute;top:50%;transform:translate(-50%,-50%);z-index:3;line-height:1;text-shadow:0 1px 2px rgba(0,0,0,.25)}.marker-circle{font-size:9px;color:#5DADE2}.marker-flag{font-size:15px;color:#138D75;font-weight:bold}.today{position:absolute;top:0;bottom:0;width:1.5px;background:#C0392B;opacity:.7;z-index:4}@media print{body{zoom:.98}}";
+  printWin.document.open();
+  printWin.document.write("<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Data Roadmap</title><style>"+printCss+"</style></head><body>"+html+"</body></html>");
+  printWin.document.close();
+  setTimeout(function(){
+    try { printWin.focus(); printWin.print(); }
+    catch(e){ alert("The print view opened, but the print dialog was blocked. Use File > Print in the new tab."); }
+  }, 350);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   MAIN ROADMAP VIEW
+   ════════════════════════════════════════════════════════════════════════════ */
+
+function DataRoadmapView(props){
+  var [startM, setStartM] = useState(RM_DEFAULT_RANGE.start);
+  var [endM, setEndM] = useState(RM_DEFAULT_RANGE.end);
+  var [groupBy, setGroupBy] = useState("team");  // "team" or "release"
+  var [grouped, setGrouped] = useState(true);
+  var [showLeg, setShowLeg] = useState(true);
+  var [sortBy, setSortBy] = useState("start");
+  var [search, setSearch] = useState("");
+  var [fTeams, setFTeams] = useState([]);
+  var [fReleases, setFReleases] = useState([]);
+  var [expanded, setExpanded] = useState(null);
+  var [tooltip, setTooltip] = useState(null);
+  var [guideOpen, setGuideOpen] = useState(false);
+
+  // Live data hook from props (passed down from App so the header can also display load state)
+  var dataState = props.dataState;
+  var reload = props.reload;
+
+  // Normalize the loaded rows. Recomputes whenever the source rows change.
+  var data = useMemo(function(){
+    if(dataState.status !== "ready") return {projects: [], milestones: [], teamColorMap: {}};
+    return normalizeRows(dataState.rows);
+  }, [dataState.status, dataState.rows]);
+  var projects = data.projects;
+  var milestones = data.milestones;
+  var teamColorMap = data.teamColorMap;
+
+  var VS = useMemo(function(){ var p = startM.split("-"); return new Date(+p[0], +p[1]-1, 1, 0, 0, 0, 0); }, [startM]);
+  var VE = useMemo(function(){ var p = endM.split("-"); return new Date(+p[0], +p[1], 0, 23, 59, 59, 999); }, [endM]);
+
+  var pct = useCallback(function(d, isEnd, noClamp){
+    if(!d) return null;
+    var D = rmParseDate(d);
+    if(!D) return null;
+    if(isEnd){ D = new Date(D.getFullYear(), D.getMonth(), D.getDate()+1); }
+    var t = VE - VS;
+    var v = ((D - VS) / t) * 100;
+    return noClamp ? v : Math.max(0, Math.min(100, v));
+  }, [VS, VE]);
+
+  var cols = useMemo(function(){ return rmGenMonths(VS, VE); }, [VS, VE]);
+  var quarters = useMemo(function(){ return rmGroupByQuarter(cols); }, [cols]);
+
+  // Unique values for filter options
+  var allTeams = useMemo(function(){
+    var set = {};
+    projects.forEach(function(p){ if(p.team) set[p.team] = true; });
+    return Object.keys(set).sort();
+  }, [projects]);
+  var allReleases = useMemo(function(){
+    var set = {};
+    projects.forEach(function(p){ if(p.dataRelease) set[p.dataRelease] = true; });
+    return Object.keys(set).sort();
+  }, [projects]);
+
+  var filtered = useMemo(function(){
+    var d = projects.filter(function(r){
+      if(fTeams.length && fTeams.indexOf(r.team) === -1) return false;
+      if(fReleases.length && fReleases.indexOf(r.dataRelease) === -1) return false;
+      if(search){
+        var q = search.toLowerCase();
+        if(r.name.toLowerCase().indexOf(q) === -1 && (r.team || "").toLowerCase().indexOf(q) === -1) return false;
+      }
+      return true;
+    });
+    d.sort(function(a, b){
+      if(sortBy === "name") return a.name.localeCompare(b.name);
+      if(sortBy === "team") return (a.team || "").localeCompare(b.team || "") || (a.start || "").localeCompare(b.start || "");
+      if(sortBy === "end")  return (a.end || "9999").localeCompare(b.end || "9999");
+      // default: start
+      return (a.start || "9999").localeCompare(b.start || "9999");
+    });
+    return d;
+  }, [projects, fTeams, fReleases, search, sortBy]);
+
+  var isAnyFilterActive = fTeams.length > 0 || fReleases.length > 0 || search !== "";
+  function clearFiltersOnly(){ setFTeams([]); setFReleases([]); setSearch(""); }
+
+  var getMs = useCallback(function(projectId){
+    return milestones.filter(function(m){ return m.projectId === projectId; });
+  }, [milestones]);
+
+  var groups = useMemo(function(){
+    if(!grouped) return [["All initiatives", filtered]];
+    var key = groupBy === "team" ? "team" : "dataRelease", g = {};
+    filtered.forEach(function(r){
+      var k = r[key] || (key === "dataRelease" ? "Unassigned release" : "Untitled");
+      if(!g[k]) g[k] = [];
+      g[k].push(r);
+    });
+    return Object.entries(g).sort(function(a, b){ return a[0].localeCompare(b[0]); });
+  }, [filtered, grouped, groupBy]);
+
+  function reset(){
+    setStartM(RM_DEFAULT_RANGE.start); setEndM(RM_DEFAULT_RANGE.end);
+    setGroupBy("team"); setSortBy("start");
+    setGrouped(true); setShowLeg(true);
+    setSearch(""); setFTeams([]); setFReleases([]);
+    setExpanded(null);
+  }
+
+  var todayP = pct(RM_TODAY.getFullYear()+"-"+String(RM_TODAY.getMonth()+1).padStart(2,"0")+"-"+String(RM_TODAY.getDate()).padStart(2,"0"), false);
+
+  var expItem = expanded ? projects.find(function(p){ return p.id === expanded; }) : null;
+  var expMs = expanded ? getMs(expanded).sort(function(a, b){ return (a.start || "9999").localeCompare(b.start || "9999"); }) : [];
+
+  useEffect(function(){
+    var msByParent = {};
+    filtered.forEach(function(it){ msByParent[it.id] = getMs(it.id); });
+    window.__roadmapPrintData = {
+      groups:groups, grouped:grouped, cols:cols, quarters:quarters,
+      vs:VS, ve:VE, today:RM_TODAY, msByParent:msByParent,
+    };
+  }, [groups, grouped, cols, quarters, VS, VE, filtered, getMs]);
+
+  // Loading / error states — show before rendering the timeline UI
+  if(dataState.status === "loading"){
+    return (
+      <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",color:"#999",fontSize:13,background:"#fff"}}>
+        Loading roadmap data…
+      </div>
+    );
+  }
+  if(dataState.status === "error"){
+    return (
+      <div style={{flex:1,padding:40,background:"#fff"}}>
+        <div style={{padding:"20px 24px",background:"#FDECEA",border:"1px solid #E6B0AA",borderRadius:8,maxWidth:600,margin:"0 auto",color:"#7B241C"}}>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:8}}>Could not load roadmap data</div>
+          <div style={{fontSize:12,marginBottom:12,lineHeight:1.5}}>{dataState.error}</div>
+          <button onClick={reload} style={{padding:"6px 14px",border:"1px solid #C0392B",background:"#fff",color:"#C0392B",borderRadius:6,cursor:"pointer",fontWeight:600}}>Retry</button>
+        </div>
+      </div>
+    );
+  }
+  if(projects.length === 0){
+    return (
+      <div style={{flex:1,padding:40,background:"#fff"}}>
+        <div style={{padding:"20px 24px",background:"#FEF9E7",border:"1px solid #F5E6A8",borderRadius:8,maxWidth:600,margin:"0 auto",color:"#7D6608"}}>
+          <div style={{fontSize:14,fontWeight:700,marginBottom:8}}>No projects to display</div>
+          <div style={{fontSize:12,marginBottom:12,lineHeight:1.5}}>The sheet loaded successfully but no rows matched the expected format. Check that rows have <strong>Cat = Project</strong> and that <strong>ShowOnRoadmap</strong> is not set to FALSE.</div>
+          <button onClick={reload} style={{padding:"6px 14px",border:"1px solid #B7950B",background:"#fff",color:"#7D6608",borderRadius:6,cursor:"pointer",fontWeight:600}}>Reload</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",background:"#fff"}}>
+
+      {/* Top controls bar */}
+      <div style={{padding:"4px 18px",borderBottom:"1px solid #ebebeb",display:"flex",alignItems:"center",justifyContent:"space-between",gap:6,background:"#fafafa"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:11,color:"#aaa"}}>{RM_TODAY.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}</span>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:6,flexWrap:"wrap",justifyContent:"flex-end"}}>
+          <HelpButton open={guideOpen} onClick={function(){setGuideOpen(true);}}/>
+          <button onClick={rmPrintRoadmap} title="Print the currently filtered roadmap" style={{fontSize:11.5,padding:"4px 11px",border:"1px solid #C8DCF0",borderRadius:6,background:"#EBF5FB",color:"#2471A3",cursor:"pointer",fontWeight:500}}>Print</button>
+          <button onClick={reset} style={{fontSize:11.5,padding:"4px 11px",border:"1px solid #e0e0e0",borderRadius:6,background:"#fff",cursor:"pointer"}}>Reset</button>
+          <span style={{fontSize:11,color:"#aaa"}}>Showing</span>
+          <span style={{fontSize:13,fontWeight:700,color:"#333"}}>{filtered.length}</span>
+          <span style={{fontSize:11,color:"#aaa"}}>of {projects.length} projects</span>
+          {isAnyFilterActive && <span style={{fontSize:10,color:"#C0392B",marginLeft:4}}>↓ {projects.length - filtered.length} hidden</span>}
+        </div>
+      </div>
+
+      {/* Filters bar */}
+      <div style={{padding:"6px 18px",borderBottom:"1px solid #ebebeb",display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",background:"#fff"}}>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:9.5,textTransform:"uppercase",color:"#bbb",fontWeight:700,letterSpacing:.05}}>Range</span>
+          <select style={{fontSize:11.5,padding:"4px 7px",border:"1px solid #e0e0e0",borderRadius:6}} value={startM} onChange={function(e){setStartM(e.target.value);}}>
+            {RM_MONTH_OPTS.map(function(o){return <option key={o.value} value={o.value}>{o.label}</option>;})}
+          </select>
+          <span style={{color:"#ccc"}}>→</span>
+          <select style={{fontSize:11.5,padding:"4px 7px",border:"1px solid #e0e0e0",borderRadius:6}} value={endM} onChange={function(e){setEndM(e.target.value);}}>
+            {RM_MONTH_OPTS.map(function(o){return <option key={o.value} value={o.value}>{o.label}</option>;})}
+          </select>
+        </div>
+        <RmSep/>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:9.5,textTransform:"uppercase",color:"#bbb",fontWeight:700,letterSpacing:.05}}>Group</span>
+          <RmSegBtn active={groupBy === "team"} onClick={function(){setGroupBy("team");}}>Team</RmSegBtn>
+          <RmSegBtn active={groupBy === "release"} onClick={function(){setGroupBy("release");}}>Data Release</RmSegBtn>
+        </div>
+        <RmSep/>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:9.5,textTransform:"uppercase",color:"#bbb",fontWeight:700,letterSpacing:.05}}>Sort</span>
+          <select style={{fontSize:11.5,padding:"4px 7px",border:"1px solid #e0e0e0",borderRadius:6}} value={sortBy} onChange={function(e){setSortBy(e.target.value);}}>
+            <option value="start">Start date</option>
+            <option value="end">End date</option>
+            <option value="team">Team</option>
+            <option value="name">Name</option>
+          </select>
+        </div>
+        <RmSep/>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <span style={{fontSize:9.5,textTransform:"uppercase",color:"#bbb",fontWeight:700,letterSpacing:.05}}>Filter</span>
+          <RmMultiSelect label="Team" options={allTeams} selected={fTeams} onChange={setFTeams}
+            getKey={function(k){return k;}} getLabel={function(k){return k;}}
+            getColor={function(k){return teamColorMap[k] ? teamColorMap[k].color : null;}}/>
+          {allReleases.length > 0 && (
+            <RmMultiSelect label="Data Release" options={allReleases} selected={fReleases} onChange={setFReleases}
+              getKey={function(k){return k;}} getLabel={function(k){return k;}}
+              getColor={function(k){var c = releaseColor(k); return c ? c.bg : null;}}/>
+          )}
+          {isAnyFilterActive && <button onClick={clearFiltersOnly} style={{background:"none",border:"none",color:"#C0392B",fontSize:11.5,cursor:"pointer",fontWeight:500}}>✕ Clear</button>}
+        </div>
+        <RmSep/>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <RmTog on={showLeg} onClick={function(){setShowLeg(!showLeg);}}>Legend</RmTog>
+        </div>
+        <div style={{marginLeft:"auto"}}>
+          <input style={{fontSize:12,padding:"5px 11px",border:"1px solid #dcdcdc",borderRadius:18,width:200}} placeholder="🔍  Search…" value={search} onChange={function(e){setSearch(e.target.value);}}/>
+        </div>
+      </div>
+
+      {/* Legend */}
+      {showLeg && (
+        <div style={{padding:"7px 18px",borderBottom:"1px solid #ebebeb",display:"flex",gap:0,alignItems:"center",flexWrap:"wrap",fontSize:11,color:"#888",background:"#fafafa",rowGap:5}}>
+          <div style={{display:"flex",alignItems:"center",gap:12,flexWrap:"wrap",paddingRight:22,marginRight:22,borderRight:"1px solid #ebebeb"}}>
+            <span style={{fontSize:9,textTransform:"uppercase",color:"#bbb",fontWeight:700,letterSpacing:.5}}>Teams</span>
+            {Object.keys(teamColorMap).map(function(t){
+              return <span key={t} style={{display:"flex",alignItems:"center",gap:6}}>
+                <span style={{width:12,height:12,borderRadius:3,background:teamColorMap[t].color,display:"inline-block"}}/>{t}
+              </span>;
+            })}
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap",paddingRight:22,marginRight:22,borderRight:"1px solid #ebebeb"}}>
+            <span style={{fontSize:9,textTransform:"uppercase",color:"#bbb",fontWeight:700,letterSpacing:.5}}>Milestones</span>
+            <span style={{display:"flex",alignItems:"center",gap:6}}><span style={{width:18,display:"inline-flex",justifyContent:"center"}}><RmCircleIcon sz={9}/></span><span>Data point</span></span>
+            <span style={{display:"flex",alignItems:"center",gap:6}}><span style={{width:18,display:"inline-flex",justifyContent:"center"}}><RmFlagIcon sz={16}/></span><span>Release / Launch</span></span>
+          </div>
+          {allReleases.length > 0 && (
+            <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+              <span style={{fontSize:9,textTransform:"uppercase",color:"#bbb",fontWeight:700,letterSpacing:.5}}>Releases</span>
+              {allReleases.map(function(rel){
+                var c = releaseColor(rel);
+                return <span key={rel} style={{fontSize:9.5,fontWeight:700,padding:"2px 7px",borderRadius:3,background:c.bg,color:c.tx,letterSpacing:.3}}>{rel}</span>;
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Timeline */}
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+        <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+          {/* Sticky timeline header */}
+          <div style={{display:"flex",flexShrink:0,borderBottom:"2px solid #e0e0e0",background:"#f7f7f7",zIndex:10,position:"sticky",top:0}}>
+            <div style={{width:RM_LABEL_W,minWidth:RM_LABEL_W,flexShrink:0,borderRight:"1px solid #e5e5e5",display:"flex",flexDirection:"column"}}>
+              <div style={{height:22,borderBottom:"1px solid #ebebeb"}}/>
+              <div style={{height:24,display:"flex",alignItems:"center",padding:"0 14px",fontSize:10,textTransform:"uppercase",letterSpacing:.8,color:"#bbb",fontWeight:600}}>Project</div>
+            </div>
+            <div id="rm-col-hdr" style={{flex:1,overflowX:"hidden",overflowY:"hidden"}}>
+              <div style={{minWidth: Math.max(500, cols.length*60)}}>
+                <div style={{display:"grid",gridTemplateColumns:"repeat("+cols.length+",1fr)",height:22,borderBottom:"1px solid #ebebeb"}}>
+                  {quarters.map(function(q){
+                    var isNowQ = cols.slice(q.start, q.start+q.count).some(function(c){return RM_TODAY >= c.start && RM_TODAY <= c.end;});
+                    return <div key={q.q} style={{gridColumn:"span "+q.count,display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:isNowQ ? "#2471A3" : "#999",background:isNowQ ? "#EBF5FB" : "transparent",borderRight:"1px solid #e0e0e0"}}>{q.q}</div>;
+                  })}
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat("+cols.length+",1fr)",height:24}}>
+                  {cols.map(function(c, i){
+                    var now = RM_TODAY >= c.start && RM_TODAY <= c.end;
+                    return <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:now ? 600 : 400,color:now ? "#2471A3" : "#bbb",background:now ? "#EBF5FB" : "transparent",borderRight:i < cols.length-1 ? "1px solid #e8e8e8" : "none"}}>{c.label}</div>;
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Scrollable rows */}
+          <div style={{flex:1,display:"flex",overflow:"auto",position:"relative"}} onScroll={function(e){var hdr = document.getElementById("rm-col-hdr"); if(hdr) hdr.scrollLeft = e.currentTarget.scrollLeft;}}>
+            {/* Sticky left label column */}
+            <div style={{width:RM_LABEL_W,minWidth:RM_LABEL_W,flexShrink:0,borderRight:"1px solid #e5e5e5",position:"sticky",left:0,zIndex:8,background:"#fff",alignSelf:"flex-start",minHeight:"100%"}}>
+              {groups.map(function(pair){
+                var gKey = pair[0], gItems = pair[1];
+                var groupColor = gItems[0] ? (groupBy === "team" ? gItems[0].teamColor : (releaseColor(gKey) ? releaseColor(gKey).tx : "#999")) : "#999";
+                var groupText  = gItems[0] ? (groupBy === "team" ? gItems[0].teamTextColor : (releaseColor(gKey) ? releaseColor(gKey).tx : "#666")) : "#666";
+                return (
+                  <div key={gKey}>
+                    {grouped && (
+                      <div style={{height:RM_ROW_H,display:"flex",alignItems:"center",justifyContent:"space-between",padding:"0 14px",background:"#f5f5f5",borderBottom:"1px solid #ebebeb",borderLeft:"3px solid "+groupColor}}>
+                        <span style={{fontSize:11.5,fontWeight:700,color:groupText}}>{gKey}</span>
+                        <span style={{fontSize:10,color:"#999"}}>{gItems.length}</span>
+                      </div>
+                    )}
+                    {gItems.map(function(item){
+                      var rowBg = expanded === item.id ? "#EBF5FB" : "transparent";
+                      var rel = releaseColor(item.dataRelease);
+                      return (
+                        <div key={item.id} onClick={function(){setExpanded(expanded === item.id ? null : item.id);}}
+                          style={{height:RM_ROW_H,display:"flex",alignItems:"center",gap:8,padding:"0 12px 0 12px",borderBottom:"1px solid #f5f5f5",borderLeft:grouped ? "3px solid "+item.teamColor+"22" : "none",overflow:"hidden",cursor:"pointer",background: rowBg,position:"relative"}}
+                          onMouseEnter={function(e){if(expanded !== item.id) e.currentTarget.style.background="#eef4fa";}}
+                          onMouseLeave={function(e){if(expanded !== item.id) e.currentTarget.style.background="transparent";}}>
+                          <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",justifyContent:"center",gap:2}}>
+                            <span style={{fontSize:12.5,fontWeight:600,color:"#222",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",lineHeight:"16px"}} title={renderText(item.name)}>{renderText(item.name)}</span>
+                            <div style={{display:"flex",alignItems:"center",gap:6,minHeight:14,lineHeight:"14px",overflow:"hidden"}}>
+                              {item.id && <span style={{fontSize:10,color:"#8a96a3",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",flexShrink:0,fontWeight:500}}>{item.id}</span>}
+                              <span style={{fontSize:9.5,color:"#888",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",minWidth:0}} title={item.team}>{item.team}</span>
+                              {rel && <span style={{fontSize:8.5,fontWeight:700,padding:"2px 6px",borderRadius:3,background:rel.bg,color:rel.tx,flexShrink:0,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",letterSpacing:.3,lineHeight:1}}>{item.dataRelease}</span>}
+                              {rmIsComplete(item) && <span style={{fontSize:8.5,fontWeight:700,padding:"2px 6px",borderRadius:3,background:"#D5F5E3",color:"#1E8449",flexShrink:0,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",letterSpacing:.3,lineHeight:1,textTransform:"uppercase"}}>Complete</span>}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Timeline rows */}
+            <div style={{flex:1,position:"relative"}}>
+              <div style={{minWidth: Math.max(500, cols.length*60),position:"relative"}}>
+                {groups.map(function(pair){
+                  var gKey = pair[0], gItems = pair[1];
+                  return (
+                    <div key={gKey}>
+                      {grouped && (
+                        <div style={{height:RM_ROW_H,background:"#f5f5f5",borderBottom:"1px solid #ebebeb",position:"relative"}}>
+                          <RmGridLines n={cols.length}/>
+                        </div>
+                      )}
+                      {gItems.map(function(item){
+                        var l2 = pct(item.start, false), r2 = pct(item.end, true);
+                        var w = (l2 !== null && r2 !== null) ? r2 - l2 : 0;
+                        var hasDates = rmHasFullDates(item), barCol = item.teamColor || "#888", isDone = rmIsComplete(item);
+                        var timelineBg = expanded === item.id ? "#EBF5FB" : "transparent";
+                        var ms = getMs(item.id);
+                        var spread = rmSpreadMs(ms, function(d, isEnd){return pct(d, isEnd, true);});
+                        return (
+                          <div key={item.id} style={{height:RM_ROW_H,position:"relative",borderBottom:"1px solid #f5f5f5",background:timelineBg}}>
+                            <RmGridLines n={cols.length} faint={true}/>
+                            {hasDates && w > 0.2 && (
+                              <div onClick={function(){setExpanded(expanded === item.id ? null : item.id);}} title={renderText(item.name)+" — "+rmFmtDate(item.start)+" → "+rmFmtDate(item.end)}
+                                style={{position:"absolute",top:11,height:18,borderRadius:4,cursor:"pointer",left:l2+"%",width:w+"%",background:barCol,opacity:isDone ? .35 : .85,zIndex:2,boxShadow:"inset 0 0 0 1px rgba(0,0,0,.05)"}}/>
+                            )}
+                            {spread.map(function(m){
+                              var isFlag = m.icon === "flag";
+                              var iconSize = isFlag ? 22 : 11;
+                              var iconColor = isFlag ? RM_MILESTONE_COLOR : RM_MILESTONE_CIRCLE_COLOR;
+                              // Vertical anchor: bigger flag needs to sit higher so its base aligns with the bar
+                              var verticalOffset = isFlag ? 8 : 13;
+                              // Horizontal centering nudge changes with size
+                              var xNudge = isFlag ? -11 : -5.5;
+                              return (
+                                <span key={m.id}
+                                  onMouseEnter={function(e){setTooltip({x:e.clientX,y:e.clientY,name:m.name,date:rmFmtDate(m.start),icon:m.icon});}}
+                                  onMouseLeave={function(){setTooltip(null);}}
+                                  onClick={function(e){e.stopPropagation();}}
+                                  style={{position:"absolute",top:verticalOffset+m.yo,left:m.pv+"%",transform:"translateX("+xNudge+"px)",zIndex:isFlag ? 11 : 10,cursor:"pointer",display:"inline-flex",flexDirection:"column",alignItems:"center",filter:"drop-shadow(0 2px 4px rgba(0,0,0,0.28))"}}>
+                                  <div style={{width:1,height:hasDates ? 4 : 2,background:iconColor,opacity:.6}}/>
+                                  <RmMsIcon icon={m.icon} sz={iconSize} col={iconColor}/>
+                                </span>
+                              );
+                            })}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })}
+                {/* Today indicator */}
+                {todayP !== null && todayP >= 0 && todayP <= 100 && (
+                  <>
+                    <div style={{position:"absolute",top:0,bottom:0,left:"calc("+todayP+"% - 12px)",width:24,background:"rgba(192,57,43,.04)",zIndex:3,pointerEvents:"none"}}/>
+                    <div style={{position:"absolute",top:0,bottom:0,left:todayP+"%",width:2,background:"#C0392B",opacity:.65,zIndex:20,pointerEvents:"none"}}>
+                      <div style={{position:"sticky",top:6,fontSize:8.5,fontWeight:800,background:"#C0392B",color:"#fff",padding:"2px 6px",borderRadius:3,whiteSpace:"nowrap",lineHeight:1.2,display:"inline-block",marginLeft:3,boxShadow:"0 1px 3px rgba(0,0,0,.18)",letterSpacing:.3}}>TODAY</div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Drill-down inspector */}
+        <div style={{width: expItem ? "440px" : "0px",minWidth: expItem ? "440px" : "0px",maxWidth:"42vw",borderLeft: expItem ? "1px solid #ececec" : "none",background:"#fafbfc",overflow:"hidden",transition:"width .2s,min-width .2s",flexShrink:0,display:"flex",flexDirection:"column",position:"relative"}}>
+          {expItem && (
+            <>
+              <button onClick={function(){setExpanded(null);}} style={{position:"absolute",top:14,right:18,border:"none",background:"none",fontSize:22,color:"#bbb",cursor:"pointer",padding:0,lineHeight:1,zIndex:10}}>×</button>
+              <div style={{padding:"14px 18px",background:"#fff",borderBottom:"1px solid #ececec"}}>
+                {expItem.id && <span style={{fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontSize:11,color:"#999"}}>{expItem.id}</span>}
+                <div style={{fontSize:15,fontWeight:700,lineHeight:1.3,color:"#111",marginBottom:8,marginTop:expItem.id ? 4 : 0}}>{renderText(expItem.name)}</div>
+                <div style={{display:"flex",gap:5,flexWrap:"wrap",alignItems:"center"}}>
+                  <span style={{fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:3,background:expItem.teamColor+"33",color:expItem.teamTextColor,letterSpacing:.3,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"}}>{expItem.team}</span>
+                  {expItem.dataRelease && (function(){
+                    var c = releaseColor(expItem.dataRelease);
+                    return <span style={{fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:3,background:c.bg,color:c.tx,letterSpacing:.3,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"}}>{expItem.dataRelease}</span>;
+                  })()}
+                  {rmIsComplete(expItem) && <span style={{fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:3,background:"#D5F5E3",color:"#1E8449",letterSpacing:.3,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",textTransform:"uppercase"}}>Complete</span>}
+                </div>
+                {expItem.overviewUrl && (
+                  <div style={{marginTop:10}}>
+                    <a href={expItem.overviewUrl} target="_blank" rel="noopener noreferrer" style={{fontSize:11,padding:"5px 10px",border:"1px solid #C8DCF0",borderRadius:6,background:"#EBF5FB",color:"#2471A3",cursor:"pointer",fontWeight:500,textDecoration:"none",display:"inline-flex",alignItems:"center"}}>View in PSI ↗</a>
+                  </div>
+                )}
+              </div>
+              <div style={{flex:1,overflowY:"auto",padding:"14px 20px"}}>
+                <div style={{marginBottom:10,padding:"10px 12px",borderRadius:6,background:"#fff",border:"1px solid #ececec"}}>
+                  <div style={{fontSize:9.5,textTransform:"uppercase",letterSpacing:.5,color:"#999",fontWeight:600,marginBottom:8}}>Project window</div>
+                  <div style={{display:"grid",gridTemplateColumns:"auto 1fr",gap:"4px 10px",fontSize:11.5,color:"#555"}}>
+                    <span style={{color:"#aaa"}}>Start</span><span>{rmFmtDate(expItem.start) || "—"}</span>
+                    <span style={{color:"#aaa"}}>End</span><span>{rmFmtDate(expItem.end) || "—"}</span>
+                  </div>
+                </div>
+                {expItem.description && (
+                  <div style={{marginBottom:10,padding:"10px 12px",borderRadius:6,background:"#fff",border:"1px solid #ececec"}}>
+                    <div style={{fontSize:9.5,textTransform:"uppercase",letterSpacing:.5,color:"#999",fontWeight:600,marginBottom:6}}>Description</div>
+                    <div style={{fontSize:11.5,whiteSpace:"pre-wrap",color:"#555",lineHeight:1.5}}>{renderText(expItem.description)}</div>
+                  </div>
+                )}
+                {expMs.length > 0 && (
+                  <div style={{padding:"10px 12px",borderRadius:6,background:"#fff",border:"1px solid #ececec"}}>
+                    <div style={{fontSize:9.5,textTransform:"uppercase",letterSpacing:.5,color:"#999",fontWeight:600,marginBottom:8}}>Milestones ({expMs.length})</div>
+                    {expMs.map(function(m){
+                      var isFlag = m.icon === "flag";
+                      return (
+                        <div key={m.id} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:"1px solid #f5f5f5"}}>
+                          <span style={{width:24,display:"inline-flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                            <RmMsIcon icon={m.icon} sz={isFlag ? 18 : 10} col={isFlag ? RM_MILESTONE_COLOR : RM_MILESTONE_CIRCLE_COLOR}/>
+                          </span>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{fontSize:11.5,fontWeight:600,color:"#333"}}>{renderText(m.name)}</div>
+                            <div style={{fontSize:10,color:"#999",marginTop:1}}>{rmFmtDate(m.start || m.end)} · {isFlag ? "Release / Launch" : "Data point"}</div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Hover tooltip for milestones */}
+      {tooltip && (
+        <div style={{position:"fixed",left:tooltip.x+12,top:tooltip.y-10,zIndex:2000,background:"#1a1a2e",color:"#fff",padding:"8px 12px",borderRadius:8,fontSize:11,pointerEvents:"none",boxShadow:"0 4px 12px rgba(0,0,0,.25)",maxWidth:240}}>
+          <div style={{fontWeight:600,marginBottom:2}}>{tooltip.name}</div>
+          <div style={{opacity:.7}}>{tooltip.date} · {tooltip.icon === "flag" ? "Release / Launch" : "Data point"}</div>
+        </div>
+      )}
+
+      {/* Help guide modal */}
+      <ViewGuide
+        open={guideOpen}
+        onClose={function(){setGuideOpen(false);}}
+        title="How to use the Data Roadmap"
+        intro="Read the timeline left to right. Bars are projects, circles and flags are milestones, and the red line marks today."
+        cards={[
+          {icon:"📅", title:"Timeline", color:"#2471A3", bg:"#F4FAFF",
+            body:<>Quarters and months run left to right. Colored bars show project duration, with each color representing a different team.</>},
+          {icon:"⚑", title:"Milestones", color:"#138D75", bg:"#F0FBF8",
+            body:<>Two milestone shapes mark events on each project timeline. <span style={{color:"#5DADE2",fontWeight:800,fontSize:13}}>●</span> Small cyan circles mark <strong>data points</strong> (e.g., data cutoff dates). <span style={{color:"#138D75",fontWeight:800,fontSize:15}}>⚑</span> Larger teal flags mark <strong>releases / launches</strong>. Hover any marker for date and type.</>},
+          {icon:"🎨", title:"Team colors", color:"#6C3483", bg:"#FBF7FF",
+            body:<>Each team is auto-assigned a distinct color. Bars and group headers share that color so projects from the same team are easy to scan together.</>},
+          {icon:"🏷", title:"Data Release tags", color:"#117A65", bg:"#F4FFFB",
+            body:<>Each project may carry a Data Release tag (e.g., <strong>CDRv9</strong>). Use the <strong>Data Release</strong> filter to see only projects feeding into a specific release, or group by Data Release.</>},
+          {icon:"🔍", title:"Filters & search", color:"#9C7A1F", bg:"#FFF9EC",
+            body:<>Narrow the view by Team, Data Release, date range, or text search. Use <strong>Reset</strong> to return to defaults.</>},
+          {icon:"🖨", title:"Print", color:"#185FA5", bg:"#F4FAFF",
+            body:<>The <strong>Print</strong> button opens a clean, landscape-oriented snapshot of the currently filtered roadmap in a new tab — ready to print or save as PDF.</>},
+        ]}
+      />
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   APP SHELL
+   ════════════════════════════════════════════════════════════════════════════ */
+
+function App(){
+  var data = useRoadmapData();
+  var state = data.state;
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      {/* Header with title, subheading, description, and live load indicator */}
+      <div style={{padding:"14px 20px 12px",background:"#fff",borderBottom:"1px solid #ececec",flexShrink:0,display:"flex",alignItems:"flex-start",justifyContent:"space-between",gap:20}}>
+        <div style={{minWidth:0,flex:1}}>
+          <div style={{fontSize:10.5,textTransform:"uppercase",letterSpacing:1.4,color:"#888",fontWeight:600,marginBottom:6}}>
+            NIH · Working Document
+          </div>
+          <div style={{fontSize:22,fontWeight:700,color:"#111",lineHeight:1.15,letterSpacing:-0.3,marginBottom:6}}>
+            <AoU/> Research Program Data Roadmap
+          </div>
+          <div style={{fontSize:14,fontWeight:600,color:"#2471A3",lineHeight:1.3,marginBottom:6}}>
+            Data Release View
+          </div>
+          <div style={{fontSize:12,color:"#666",lineHeight:1.5,fontStyle:"italic"}}>
+            Working document that will be updated frequently due to program and awardee input and decisions.
+          </div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0,flexWrap:"wrap"}}>
+          {state.status === "ready" && state.loadedAt && (
+            <span title={"Data loaded at "+state.loadedAt.toLocaleString()} style={{fontSize:11,padding:"3px 10px",borderRadius:20,background:"#EAF7EF",color:"#1E8449",fontWeight:600}}>
+              ● live · {state.loadedAt.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"})}
+            </span>
+          )}
+          {state.status === "loading" && (
+            <span style={{fontSize:11,padding:"3px 10px",borderRadius:20,background:"#EBF5FB",color:"#2471A3",fontWeight:600}}>↻ loading…</span>
+          )}
+          {state.status === "error" && (
+            <span style={{fontSize:11,padding:"3px 10px",borderRadius:20,background:"#FDECEA",color:"#C0392B",fontWeight:600}} title={state.error}>● load failed</span>
+          )}
+          <button onClick={data.reload} title="Re-fetch the latest data from the sheet" style={{fontSize:11.5,padding:"6px 12px",border:"1px solid #C8DCF0",borderRadius:6,background:"#EBF5FB",color:"#2471A3",cursor:"pointer",fontWeight:500}}>
+            ↻ Refresh
+          </button>
+        </div>
+      </div>
+      <DataRoadmapView dataState={state} reload={data.reload}/>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+
+</script>
+</body>
+</html>
