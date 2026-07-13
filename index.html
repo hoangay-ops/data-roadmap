@@ -873,7 +873,6 @@ function DataRoadmapView(props){
                           <div style={{flex:1,minWidth:0,display:"flex",flexDirection:"column",justifyContent:"center",gap:2}}>
                             <span style={{fontSize:12.5,fontWeight:600,color:"#222",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",lineHeight:"16px"}} title={renderText(item.name)}>{renderText(item.name)}</span>
                             <div style={{display:"flex",alignItems:"center",gap:6,minHeight:14,lineHeight:"14px",overflow:"hidden"}}>
-                              {item.id && <span style={{fontSize:10,color:"#8a96a3",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",flexShrink:0,fontWeight:500}}>{item.id}</span>}
                               <span style={{fontSize:9.5,color:"#888",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",minWidth:0}} title={item.team}>{item.team}</span>
                               {rel && <span style={{fontSize:8.5,fontWeight:700,padding:"2px 6px",borderRadius:3,background:rel.bg,color:rel.tx,flexShrink:0,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",letterSpacing:.3,lineHeight:1}}>{item.dataRelease}</span>}
                               {rmIsComplete(item) && <span style={{fontSize:8.5,fontWeight:700,padding:"2px 6px",borderRadius:3,background:"#D5F5E3",color:"#1E8449",flexShrink:0,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",letterSpacing:.3,lineHeight:1,textTransform:"uppercase"}}>Complete</span>}
@@ -958,8 +957,7 @@ function DataRoadmapView(props){
             <>
               <button onClick={function(){setExpanded(null);}} style={{position:"absolute",top:14,right:18,border:"none",background:"none",fontSize:22,color:"#bbb",cursor:"pointer",padding:0,lineHeight:1,zIndex:10}}>×</button>
               <div style={{padding:"14px 18px",background:"#fff",borderBottom:"1px solid #ececec"}}>
-                {expItem.id && <span style={{fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontSize:11,color:"#999"}}>{expItem.id}</span>}
-                <div style={{fontSize:15,fontWeight:700,lineHeight:1.3,color:"#111",marginBottom:8,marginTop:expItem.id ? 4 : 0}}>{renderText(expItem.name)}</div>
+                <div style={{fontSize:15,fontWeight:700,lineHeight:1.3,color:"#111",marginBottom:8}}>{renderText(expItem.name)}</div>
                 <div style={{display:"flex",gap:5,flexWrap:"wrap",alignItems:"center"}}>
                   <span style={{fontSize:10,fontWeight:700,padding:"3px 8px",borderRadius:3,background:expItem.teamColor+"33",color:expItem.teamTextColor,letterSpacing:.3,fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"}}>{expItem.team}</span>
                   {expItem.dataRelease && (function(){
